@@ -3,6 +3,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+#define DBG(...) do { char _b[256]; _snprintf_s(_b, sizeof(_b), _TRUNCATE, __VA_ARGS__); OutputDebugStringA(_b); } while(0)
 
 #define ENV_VAR "PROXY_WRAPPER_PROXY"
 #define JMP_SIZE 5
@@ -258,11 +261,15 @@ static int socks5_handshake(SOCKET s, const struct sockaddr *target, int namelen
     (void)namelen;
     unsigned char buf[22];
     unsigned char greet[] = {5, 1, 0};
-    if (send(s, (const char *)greet, sizeof(greet), 0) != sizeof(greet))
+    if (send(s, (const char *)greet, sizeof(greet), 0) != sizeof(greet)) {
+        DBG("[socks_hook] socks5: send greet failed gle=%lu", GetLastError());
         return -1;
+    }
     int r = recv(s, (char *)buf, 2, 0);
-    if (r != 2 || buf[0] != 5 || buf[1] != 0)
+    if (r != 2 || buf[0] != 5 || buf[1] != 0) {
+        DBG("[socks_hook] socks5: recv auth failed r=%d buf=%02x %02x gle=%lu", r, buf[0], buf[1], GetLastError());
         return -1;
+    }
     unsigned char req[22];
     int req_len;
     req[0] = 5; req[1] = 1; req[2] = 0;
@@ -279,11 +286,28 @@ static int socks5_handshake(SOCKET s, const struct sockaddr *target, int namelen
         memcpy(req + 20, &in6->sin6_port, 2);
         req_len = 22;
     } else return -1;
-    if (send(s, (const char *)req, req_len, 0) != req_len)
+    if (send(s, (const char *)req, req_len, 0) != req_len) {
+        DBG("[socks_hook] socks5: send req failed gle=%lu", GetLastError());
         return -1;
-    r = recv(s, (char *)buf, sizeof(buf), 0);
-    if (r < 10 || buf[0] != 5 || buf[1] != 0)
+    }
+    r = recv(s, (char *)buf, 4, 0);
+    if (r != 4 || buf[0] != 5 || buf[1] != 0) {
+        DBG("[socks_hook] socks5: recv rsp hdr failed r=%d buf=%02x %02x gle=%lu", r, buf[0], buf[1], GetLastError());
         return -1;
+    }
+    int rest;
+    switch (buf[3]) {
+    case 1: rest = 6;  break;
+    case 4: rest = 18; break;
+    default:
+        DBG("[socks_hook] socks5: unknown atyp %d", buf[3]);
+        return -1;
+    }
+    r = recv(s, (char *)buf + 4, rest, 0);
+    if (r != rest) {
+        DBG("[socks_hook] socks5: recv rsp body failed r=%d rest=%d gle=%lu", r, rest, GetLastError());
+        return -1;
+    }
     return 0;
 }
 
@@ -321,27 +345,51 @@ static int should_bypass(const struct sockaddr *name)
 
 static int do_proxy_connect(SOCKET s, const struct sockaddr *name, int namelen)
 {
-    if (ensure_proxy_resolved() != 0) return -1;
-    if (should_bypass(name))
+    if (ensure_proxy_resolved() != 0) {
+        DBG("[socks_hook] do_proxy_connect: ensure_proxy_resolved failed");
+        return -1;
+    }
+    if (should_bypass(name)) {
+        DBG("[socks_hook] do_proxy_connect: bypass, direct conn");
         return g_orig_connect(s, name, namelen);
+    }
+    {
+        struct sockaddr_in *in = (struct sockaddr_in *)name;
+        unsigned char *ip = (unsigned char *)&in->sin_addr;
+        DBG("[socks_hook] do_proxy_connect: proxying conn to %u.%u.%u.%u:%d",
+            (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3],
+            ntohs(in->sin_port));
+    }
     int r = g_orig_connect(s, (const struct sockaddr *)&g_proxy_addr, sizeof(g_proxy_addr));
-    if (r != 0) return r;
-    if (socks5_handshake(s, name, namelen) != 0) { closesocket(s); return -1; }
+    if (r != 0) {
+        DBG("[socks_hook] do_proxy_connect: g_orig_connect to proxy failed r=%d gle=%lu", r, GetLastError());
+        return r;
+    }
+    if (socks5_handshake(s, name, namelen) != 0) {
+        DBG("[socks_hook] do_proxy_connect: socks5_handshake failed");
+        closesocket(s); return -1;
+    }
+    DBG("[socks_hook] do_proxy_connect: proxy connection OK");
     return 0;
 }
 
 static int WINAPI hooked_connect(SOCKET s, const struct sockaddr *name, int namelen)
 {
     if (!g_orig_connect) return -1;
-    return do_proxy_connect(s, name, namelen);
+    int r = do_proxy_connect(s, name, namelen);
+    DBG("[socks_hook] hooked_connect: returning %d (gle=%lu)", r, GetLastError());
+    return r;
 }
 
 static int WINAPI hooked_wsaconnect(SOCKET s, const struct sockaddr *name, int namelen,
     LPWSABUF cb, LPWSABUF db, LPQOS sq, LPQOS gq)
 {
     if (!g_orig_connect) return -1;
-    if (do_proxy_connect(s, name, namelen) != 0)
+    if (do_proxy_connect(s, name, namelen) != 0) {
+        DBG("[socks_hook] hooked_wsaconnect: do_proxy_connect failed, calling orig");
         return g_orig_wsaconnect(s, name, namelen, cb, db, sq, gq);
+    }
+    DBG("[socks_hook] hooked_wsaconnect: returning 0");
     return 0;
 }
 
@@ -664,7 +712,10 @@ BOOL WINAPI DllMain(HINSTANCE dll, DWORD reason, LPVOID res)
                 strncpy(g_cfg.host, buf, sizeof(g_cfg.host) - 1);
                 g_cfg.host[sizeof(g_cfg.host) - 1] = 0;
                 g_cfg.port = (unsigned short)atoi(c);
+                DBG("[socks_hook] DllMain: proxy=%s:%d, pid=%lu", g_cfg.host, (int)g_cfg.port, GetCurrentProcessId());
                 install_hooks();
+                DBG("[socks_hook] DllMain: hooks installed, g_orig_connect=%p, g_orig_wsaconnect=%p",
+                    g_orig_connect, g_orig_wsaconnect);
             }
         }
     }
