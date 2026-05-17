@@ -356,6 +356,51 @@ static BOOL WINAPI hooked_createprocessa(
     return r;
 }
 
+// Find RIP-relative disp32 offset within an instruction, or -1.
+// code points to the full instruction (prefixes + opcode + operands).
+static int rip_disp_off(BYTE *code)
+{
+    int o = 0;
+#ifdef _WIN64
+    while (code[o] >= 0x40 && code[o] <= 0x4F) o++;
+#endif
+    BYTE b = code[o];
+    int uses = 0; /* 0 = no ModRM, 1 = 1-byte opcode+ModRM, 2 = 2-byte opcode(0F)+ModRM */
+    if (b == 0x0F) {
+        BYTE op2 = code[o + 1];
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF ||
+            (op2 & 0xF0) == 0x40 || op2 == 0xAF)
+            uses = 2;
+    } else if (
+        b == 0x88 || b == 0x89 || b == 0x8A || b == 0x8B || b == 0x8D ||
+        b == 0x38 || b == 0x39 || b == 0x3A || b == 0x3B ||
+        b == 0x85 || b == 0x84 || b == 0x86 || b == 0x87 ||
+        b == 0x33 || b == 0x01 || b == 0x02 || b == 0x03 ||
+        b == 0x08 || b == 0x09 || b == 0x0A || b == 0x0B ||
+        b == 0x11 || b == 0x12 || b == 0x13 ||
+        b == 0x19 || b == 0x1A || b == 0x1B ||
+        b == 0x21 || b == 0x22 || b == 0x23 ||
+        b == 0x29 || b == 0x2A || b == 0x2B ||
+        b == 0x31 || b == 0x32 ||
+        b == 0x80 || b == 0x81 || b == 0x82 || b == 0x83 ||
+        b == 0xC7 || b == 0xF6 || b == 0xF7 ||
+        b == 0xFF || b == 0x8F) {
+        uses = 1;
+    }
+    if (!uses) return -1;
+
+    int mo = o + uses; /* ModRM offset */
+    BYTE mr = code[mo];
+    int mod = (mr >> 6) & 3;
+    int rm  = mr & 7;
+    if (mod == 0 && rm == 5)           return mo + 1;                   /* [rip+disp32] */
+    if (mod != 3 && rm == 4) {         /* SIB */
+        BYTE sib = code[mo + 1];
+        if (mod == 0 && (sib & 7) == 5) return mo + 2;                 /* SIB + [rip+disp32] */
+    }
+    return -1;
+}
+
 static int do_trampoline(void *func, void *hook, BYTE *saved, int *sn, void **out)
 {
     int pos = 0;
@@ -371,6 +416,23 @@ static int do_trampoline(void *func, void *hook, BYTE *saved, int *sn, void **ou
 
     memcpy(saved, func, pos);
     memcpy(t, func, pos);
+
+    /* Fix RIP-relative displacements — the trampoline lives at a different address */
+    int diff = (int)((BYTE *)func - (BYTE *)t);
+    if (diff) {
+        int scan = 0;
+        while (scan < pos) {
+            int r = rip_disp_off((BYTE *)func + scan);
+            if (r >= 0) {
+                int *d = (int *)((BYTE *)t + scan + r);
+                *d += diff;
+            }
+            int l = inst_len((BYTE *)func + scan);
+            if (l <= 0) break;
+            scan += l;
+        }
+    }
+
     BYTE *tj = (BYTE *)t + pos;
     tj[0] = 0xE9;
     *(DWORD *)(tj + 1) = (DWORD)((BYTE *)func + pos - ((BYTE *)tj + 5));
