@@ -309,8 +309,12 @@ static int should_bypass(const struct sockaddr *name)
 {
     if (name->sa_family == AF_INET) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)name;
-        return in->sin_addr.s_addr == g_proxy_addr.sin_addr.s_addr &&
-               in->sin_port == g_proxy_addr.sin_port;
+        if (in->sin_addr.s_addr == g_proxy_addr.sin_addr.s_addr &&
+            in->sin_port == g_proxy_addr.sin_port)
+            return 1;
+        unsigned long a = ntohl(in->sin_addr.s_addr);
+        if ((a >> 24) == 127) return 1;
+        if (ntohs(in->sin_port) == 53) return 1;
     }
     return 0;
 }
