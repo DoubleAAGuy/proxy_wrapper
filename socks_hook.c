@@ -87,20 +87,35 @@ static int inst_len(BYTE *code)
             return o + 2 + modrm_off(code, o + 2);
         if (op2 == 0xAF) /* IMUL */
             return o + 2 + modrm_off(code, o + 2);
+        /* SETcc (0x90-0x9F), CMPXCHG (0xB0-0xB1), XADD (0xC0-0xC1) and
+           all other ModRM-based 2-byte opcodes for safety */
+        if ((op2 & 0xF0) == 0x90 ||  /* SETcc */
+            (op2 & 0xFC) == 0xB0 ||  /* CMPXCHG */
+            (op2 & 0xFE) == 0xC0 ||  /* XADD */
+            op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB ||
+            op2 == 0xA4 || op2 == 0xAC ||  /* SHLD / SHRD (ModRM + imm8) */
+            op2 == 0x02 || op2 == 0x03)    /* LAR / LSL */
+            return o + 2 + modrm_off(code, o + 2);
+        if (op2 == 0xA4 || op2 == 0xAC || op2 == 0xC4 || op2 == 0xC5)
+            return o + 2 + modrm_off(code, o + 2) + 1;  /* +imm8 */
         return 0;
     }
 
-    /* MOV r/m,r | MOV r,r/m | MOVZX | LEA | CMP | TEST | XOR | ADD/OR/ADC/SBB/AND/SUB/XOR r/m,reg */
-    if (b == 0x88 || b == 0x89 || b == 0x8A || b == 0x8B || b == 0x8D ||
-        b == 0x38 || b == 0x39 || b == 0x3A || b == 0x3B ||
-        b == 0x85 || b == 0x84 || b == 0x86 || b == 0x87 ||
-        b == 0x33 || b == 0x01 || b == 0x02 || b == 0x03 ||
-        b == 0x08 || b == 0x09 || b == 0x0A || b == 0x0B ||
-        b == 0x11 || b == 0x12 || b == 0x13 ||
-        b == 0x19 || b == 0x1A || b == 0x1B ||
-        b == 0x21 || b == 0x22 || b == 0x23 ||
-        b == 0x29 || b == 0x2A || b == 0x2B ||
-        b == 0x31 || b == 0x32)
+    /* ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m8/r, r8/r (all 16 variants) */
+    if (b <= 0x03 ||
+        (b >= 0x08 && b <= 0x0B) ||
+        (b >= 0x10 && b <= 0x13) ||
+        (b >= 0x18 && b <= 0x1B) ||
+        (b >= 0x20 && b <= 0x23) ||
+        (b >= 0x28 && b <= 0x2B) ||
+        (b >= 0x30 && b <= 0x33) ||
+        (b >= 0x38 && b <= 0x3B) ||
+        b == 0x63 ||       /* MOVSXD (x64) */
+        b == 0x84 || b == 0x85 ||  /* TEST */
+        b == 0x86 || b == 0x87 ||  /* XCHG */
+        b == 0x88 || b == 0x89 ||  /* MOV r/m, r */
+        b == 0x8A || b == 0x8B ||  /* MOV r, r/m */
+        b == 0x8C || b == 0x8D || b == 0x8E)  /* MOV Sreg / LEA / MOV Sreg */
         return o + 1 + modrm_off(code, o + 1);
 
     /* Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm8/imm32 */
@@ -108,8 +123,25 @@ static int inst_len(BYTE *code)
     if (b == 0x81) return o + 1 + modrm_off(code, o + 1) + 4;  /* imm32 */
     if (b == 0x83) return o + 1 + modrm_off(code, o + 1) + 1;  /* imm8 */
 
+    /* IMUL r, r/m, imm */
+    if (b == 0x69) return o + 1 + modrm_off(code, o + 1) + 4;  /* imm32 */
+    if (b == 0x6B) return o + 1 + modrm_off(code, o + 1) + 1;  /* imm8 */
+
+    /* Group 2: SHL/SHR/SAR/ROL/ROR/RCL/RCR */
+    if (b == 0xC0) return o + 1 + modrm_off(code, o + 1) + 1;  /* r/m8, imm8 */
+    if (b == 0xC1) return o + 1 + modrm_off(code, o + 1) + 1;  /* r/m32/64, imm8 */
+    if (b == 0xD0) return o + 1 + modrm_off(code, o + 1);      /* r/m8, 1 */
+    if (b == 0xD1) return o + 1 + modrm_off(code, o + 1);      /* r/m32/64, 1 */
+    if (b == 0xD2) return o + 1 + modrm_off(code, o + 1);      /* r/m8, CL */
+    if (b == 0xD3) return o + 1 + modrm_off(code, o + 1);      /* r/m32/64, CL */
+
     /* MOV r/m, imm32 */
     if (b == 0xC7) return o + 1 + modrm_off(code, o + 1) + 4;
+    /* MOV r/m8, imm8 */
+    if (b == 0xC6) return o + 1 + modrm_off(code, o + 1) + 1;
+
+    /* Group 4: INC/DEC r/m8 */
+    if (b == 0xFE) return o + 1 + modrm_off(code, o + 1);
 
     /* Group 3 */
     if (b == 0xF6 || b == 0xF7) {
@@ -130,6 +162,7 @@ static int inst_len(BYTE *code)
         return o + 1 + modrm_off(code, o + 1);
     if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90)
         return o + 1;
+    if (b == 0xC2 || b == 0xCA) return o + 3;  /* RET imm16 */
     return 0;
 }
 #else
@@ -150,14 +183,34 @@ static int inst_len(BYTE *code)
         b == 0x19 || b == 0x1A || b == 0x1B ||
         b == 0x21 || b == 0x22 || b == 0x23 ||
         b == 0x29 || b == 0x2A || b == 0x2B ||
-        b == 0x31 || b == 0x32)
+        b == 0x31 || b == 0x32 ||
+        b <= 0x03 ||
+        (b >= 0x10 && b <= 0x13) ||
+        (b >= 0x18 && b <= 0x1B) ||
+        (b >= 0x20 && b <= 0x23) ||
+        (b >= 0x28 && b <= 0x2B) ||
+        (b >= 0x30 && b <= 0x33) ||
+        b == 0x8C || b == 0x8E)
         return 1 + modrm_off(code, 1);
 
     if (b == 0x80 || b == 0x82) return 1 + modrm_off(code, 1) + 1;
     if (b == 0x81) return 1 + modrm_off(code, 1) + 4;
     if (b == 0x83) return 1 + modrm_off(code, 1) + 1;
 
+    if (b == 0x69) return 1 + modrm_off(code, 1) + 4;
+    if (b == 0x6B) return 1 + modrm_off(code, 1) + 1;
+
+    if (b == 0xC0) return 1 + modrm_off(code, 1) + 1;
+    if (b == 0xC1) return 1 + modrm_off(code, 1) + 1;
+    if (b == 0xD0) return 1 + modrm_off(code, 1);
+    if (b == 0xD1) return 1 + modrm_off(code, 1);
+    if (b == 0xD2) return 1 + modrm_off(code, 1);
+    if (b == 0xD3) return 1 + modrm_off(code, 1);
+
     if (b == 0xC7) return 1 + modrm_off(code, 1) + 4;
+    if (b == 0xC6) return 1 + modrm_off(code, 1) + 1;
+
+    if (b == 0xFE) return 1 + modrm_off(code, 1);
 
     if (b == 0xF6 || b == 0xF7) {
         BYTE mr = code[1];
@@ -192,6 +245,7 @@ static int inst_len(BYTE *code)
     if (b >= 0x70 && b <= 0x7F) return 2;
     if (b == 0xFF || b == 0x8F) return 1 + modrm_off(code, 1);
     if (b == 0xC3 || b == 0xC9 || b == 0x90 || b == 0xCC) return 1;
+    if (b == 0xC2 || b == 0xCA) return 3;
     if (b == 0xA1 || b == 0xA2 || b == 0xA3) return 5;
     if (b >= 0xB0 && b <= 0xB7) return 2;
     if (b >= 0xB8 && b <= 0xBF) return 5;
@@ -357,48 +411,147 @@ static BOOL WINAPI hooked_createprocessa(
 }
 
 // Find RIP-relative disp32 offset within an instruction, or -1.
-// code points to the full instruction (prefixes + opcode + operands).
+// Works for all x64 one-byte and two-byte (0F xx) opcodes.
+// Uses blacklist approach: only known non-ModRM opcodes return -1.
 static int rip_disp_off(BYTE *code)
 {
     int o = 0;
-#ifdef _WIN64
     while (code[o] >= 0x40 && code[o] <= 0x4F) o++;
-#endif
+    while (code[o] == 0xF0 || code[o] == 0xF2 || code[o] == 0xF3 ||
+           code[o] == 0x66 || code[o] == 0x67 ||
+           code[o] == 0x2E || code[o] == 0x3E || code[o] == 0x26 ||
+           code[o] == 0x64 || code[o] == 0x65)
+        o++;
     BYTE b = code[o];
-    int uses = 0; /* 0 = no ModRM, 1 = 1-byte opcode+ModRM, 2 = 2-byte opcode(0F)+ModRM */
+
     if (b == 0x0F) {
         BYTE op2 = code[o + 1];
-        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF ||
-            (op2 & 0xF0) == 0x40 || op2 == 0xAF)
-            uses = 2;
-    } else if (
-        b == 0x88 || b == 0x89 || b == 0x8A || b == 0x8B || b == 0x8D ||
-        b == 0x38 || b == 0x39 || b == 0x3A || b == 0x3B ||
-        b == 0x85 || b == 0x84 || b == 0x86 || b == 0x87 ||
-        b == 0x33 || b == 0x01 || b == 0x02 || b == 0x03 ||
-        b == 0x08 || b == 0x09 || b == 0x0A || b == 0x0B ||
-        b == 0x11 || b == 0x12 || b == 0x13 ||
-        b == 0x19 || b == 0x1A || b == 0x1B ||
-        b == 0x21 || b == 0x22 || b == 0x23 ||
-        b == 0x29 || b == 0x2A || b == 0x2B ||
-        b == 0x31 || b == 0x32 ||
-        b == 0x80 || b == 0x81 || b == 0x82 || b == 0x83 ||
-        b == 0xC7 || b == 0xF6 || b == 0xF7 ||
-        b == 0xFF || b == 0x8F) {
-        uses = 1;
+        if ((op2 >= 0x80 && op2 <= 0x8F) ||
+            op2 == 0x05 || op2 == 0x07 ||
+            op2 == 0xA0 || op2 == 0xA1 ||
+            op2 == 0xA8 || op2 == 0xA9 ||
+            op2 == 0x30 || op2 == 0x31 ||
+            op2 == 0x32 || op2 == 0x33 ||
+            op2 == 0x34 || op2 == 0x35 ||
+            op2 == 0x37)
+            return -1;
+        int mo = o + 2;
+        BYTE mr = code[mo];
+        int mod = (mr >> 6) & 3;
+        int rm  = mr & 7;
+        if (mod == 0 && rm == 5)           return mo + 1;
+        if (mod != 3 && rm == 4) {
+            if (mod == 0 && (code[mo + 1] & 7) == 5) return mo + 2;
+        }
+        return -1;
     }
-    if (!uses) return -1;
 
-    int mo = o + uses; /* ModRM offset */
+    /* 1-byte opcodes that DON'T use ModRM */
+    if ((b >= 0x50 && b <= 0x5F) ||  /* PUSH/POP reg */
+        (b >= 0x70 && b <= 0x7F) ||  /* Jcc rel8 */
+        (b >= 0xE0 && b <= 0xE3) ||  /* LOOP/JECXZ */
+        (b >= 0xB0 && b <= 0xBF) ||  /* MOV r, imm8/32 */
+        (b >= 0xA0 && b <= 0xA3) ||  /* MOV moffs */
+        (b >= 0xA8 && b <= 0xAD) ||  /* TEST/STOS/LODS/SCAS/CMPS */
+        (b >= 0x04 && b <= 0x05) ||
+        (b >= 0x0C && b <= 0x0D) ||
+        (b >= 0x14 && b <= 0x15) ||
+        (b >= 0x1C && b <= 0x1D) ||
+        (b >= 0x24 && b <= 0x25) ||
+        (b >= 0x2C && b <= 0x2D) ||
+        (b >= 0x34 && b <= 0x35) ||
+        (b >= 0x3C && b <= 0x3D) ||
+        b == 0xE8 || b == 0xE9 || b == 0xEB ||
+        b == 0x6A || b == 0x68 ||
+        b == 0x06 || b == 0x07 ||
+        b == 0x0E || b == 0x0F ||
+        b == 0x16 || b == 0x17 ||
+        b == 0x1E || b == 0x1F ||
+        b == 0x27 || b == 0x2F ||
+        b == 0x37 || b == 0x3F ||
+        b == 0x60 || b == 0x61 || b == 0x62 ||
+        b == 0x6C || b == 0x6D || b == 0x6E || b == 0x6F ||
+        b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90 ||
+        b == 0x9C || b == 0x9D ||
+        b == 0xC2 || b == 0xCA ||
+        b == 0xE4 || b == 0xE5 || b == 0xE6 || b == 0xE7 ||
+        b == 0xEC || b == 0xED || b == 0xEE || b == 0xEF ||
+        b == 0xF4 || b == 0xF5 ||
+        b == 0xF8 || b == 0xF9 || b == 0xFA || b == 0xFB ||
+        b == 0xFC || b == 0xFD) {
+        return -1;
+    }
+
+    /* Has ModRM at offset o+1 */
+    int mo = o + 1;
     BYTE mr = code[mo];
     int mod = (mr >> 6) & 3;
     int rm  = mr & 7;
-    if (mod == 0 && rm == 5)           return mo + 1;                   /* [rip+disp32] */
-    if (mod != 3 && rm == 4) {         /* SIB */
+    if (mod == 0 && rm == 5)           return mo + 1;
+    if (mod != 3 && rm == 4) {
         BYTE sib = code[mo + 1];
-        if (mod == 0 && (sib & 7) == 5) return mo + 2;                 /* SIB + [rip+disp32] */
+        if (mod == 0 && (sib & 7) == 5) return mo + 2;
     }
     return -1;
+}
+
+/* Allocate executable memory within NEAR_MAX bytes of target.
+   Uses VirtualQuery to find free pages (same approach as MinHook). */
+#define NEAR_MAX 0x20000000  /* 512 MB in each direction = 1GB total span */
+
+static void *alloc_near(void *target, size_t size)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD gran = si.dwAllocationGranularity;  /* typically 64 KB */
+    ULONG_PTR low  = (ULONG_PTR)si.lpMinimumApplicationAddress;
+    ULONG_PTR high = (ULONG_PTR)si.lpMaximumApplicationAddress;
+    ULONG_PTR t = (ULONG_PTR)target;
+
+    ULONG_PTR minAddr = (t > NEAR_MAX) ? (t - NEAR_MAX) : low;
+    ULONG_PTR maxAddr = (t + NEAR_MAX < high) ? (t + NEAR_MAX) : high;
+
+    /* Adjust for size */
+    if (maxAddr > size) maxAddr -= size; else maxAddr = low;
+    if (maxAddr < minAddr) return NULL;
+
+    /* Search backward from target */
+    {
+        ULONG_PTR tryAddr = t;
+        tryAddr -= tryAddr % gran;
+        while (tryAddr >= minAddr) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)tryAddr, &mbi, sizeof(mbi)))
+                break;
+            if (mbi.State == MEM_FREE && mbi.RegionSize >= size) {
+                void *p = VirtualAlloc((void *)tryAddr, size,
+                    MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (p) return p;
+            }
+            tryAddr = (ULONG_PTR)mbi.AllocationBase;
+            if (tryAddr < gran) break;
+            tryAddr -= gran;
+        }
+    }
+
+    /* Search forward from target */
+    {
+        ULONG_PTR tryAddr = t - (t % gran) + gran;
+        while (tryAddr <= maxAddr) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)tryAddr, &mbi, sizeof(mbi)))
+                break;
+            if (mbi.State == MEM_FREE && mbi.RegionSize >= size) {
+                void *p = VirtualAlloc((void *)tryAddr, size,
+                    MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (p) return p;
+            }
+            tryAddr = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+            tryAddr = (tryAddr + gran - 1) / gran * gran;
+        }
+    }
+
+    return NULL;
 }
 
 static int do_trampoline(void *func, void *hook, BYTE *saved, int *sn, void **out)
@@ -411,14 +564,27 @@ static int do_trampoline(void *func, void *hook, BYTE *saved, int *sn, void **ou
     }
     if (pos < JMP_SIZE) pos = JMP_SIZE;
 
-    void *t = VirtualAlloc(NULL, pos + JMP_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    /* Allocate the trampoline NEAR the target so that 32-bit relative
+       jumps and RIP-relative displacement adjustments work correctly. */
+    void *t = alloc_near(func, pos + JMP_SIZE);
     if (!t) return -1;
 
     memcpy(saved, func, pos);
     memcpy(t, func, pos);
 
-    /* Fix RIP-relative displacements — the trampoline lives at a different address */
-    int diff = (int)((BYTE *)func - (BYTE *)t);
+    /* Fix RIP-relative displacements in the trampoline copy.
+       Because alloc_near guarantees t is within NEAR_MAX of func,
+       the difference fits in a 32-bit signed int. */
+    /* Verify the adjustment fits in 32-bit signed (should always be true
+       thanks to alloc_near, but check anyway). */
+    intptr_t d64 = (BYTE *)func - (BYTE *)t;
+#if defined(_WIN64) || defined(__x86_64__)
+    if (d64 > 0x7FFFFFFFLL || d64 < -0x7FFFFFFFLL) {
+        VirtualFree(t, 0, MEM_RELEASE);
+        return -1;
+    }
+#endif
+    int diff = (int)d64;
     if (diff) {
         int scan = 0;
         while (scan < pos) {
