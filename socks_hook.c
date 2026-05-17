@@ -124,6 +124,10 @@ static int inst_len(BYTE *code)
     if (b == 0xEB)              return o + 2;   /* JMP rel8 */
     if (b >= 0x70 && b <= 0x7F) return o + 2;   /* Jcc rel8 */
     if (b >= 0x50 && b <= 0x5F) return o + 1;   /* PUSH/POP */
+    if (b == 0x6A) return o + 2;                /* PUSH imm8 */
+    if (b == 0x68) return o + 5;                /* PUSH imm32 */
+    if (b == 0xFF || b == 0x8F)                 /* INC/DEC/CALL/JMP/PUSH/POP r/m */
+        return o + 1 + modrm_off(code, o + 1);
     if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90)
         return o + 1;
     return 0;
@@ -186,6 +190,7 @@ static int inst_len(BYTE *code)
     if (b == 0xE9 || b == 0xE8) return 5;
     if (b == 0xEB)              return 2;
     if (b >= 0x70 && b <= 0x7F) return 2;
+    if (b == 0xFF || b == 0x8F) return 1 + modrm_off(code, 1);
     if (b == 0xC3 || b == 0xC9 || b == 0x90 || b == 0xCC) return 1;
     if (b == 0xA1 || b == 0xA2 || b == 0xA3) return 5;
     if (b >= 0xB0 && b <= 0xB7) return 2;
