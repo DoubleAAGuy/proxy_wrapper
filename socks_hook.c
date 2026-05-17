@@ -10,30 +10,33 @@
 typedef int (WINAPI *connect_t)(SOCKET, const struct sockaddr *, int);
 typedef int (WINAPI *wsaconnect_t)(SOCKET, const struct sockaddr *, int,
     LPWSABUF, LPWSABUF, LPQOS, LPQOS);
+typedef BOOL (WINAPI *createprocessw_t)(LPCWSTR, LPWSTR,
+    LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+    LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *createprocessa_t)(LPCSTR, LPSTR,
+    LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD,
+    LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
-typedef struct {
-    char host[256];
-    unsigned short port;
-} proxy_cfg_t;
+typedef struct { char host[256]; unsigned short port; } proxy_cfg_t;
 
+static HMODULE g_dll;
 static proxy_cfg_t g_cfg;
-
-static struct {
-    connect_t trampoline;
-    void *target;
-    BYTE saved[16];
-    int save_size;
-} g_connect;
-
-static struct {
-    wsaconnect_t trampoline;
-    void *target;
-    BYTE saved[16];
-    int save_size;
-} g_wsaconnect;
-
 static struct sockaddr_in g_proxy_addr;
-static int g_proxy_resolved = 0;
+static int g_proxy_ready = 0;
+static LONG g_in_create = 0;
+
+static connect_t g_orig_connect;
+static wsaconnect_t g_orig_wsaconnect;
+static createprocessw_t g_orig_cpw;
+static createprocessa_t g_orig_cpa;
+
+static BYTE g_saved_conn[16]; static int g_saved_conn_n;
+static BYTE g_saved_wsa[16];  static int g_saved_wsa_n;
+static BYTE g_saved_cpw[16];  static int g_saved_cpw_n;
+static BYTE g_saved_cpa[16];  static int g_saved_cpa_n;
+
+static void *g_target_connect;
+static void *g_target_wsaconnect;
 
 #ifdef _WIN64
 static int inst_len(BYTE *code)
@@ -81,11 +84,9 @@ static int inst_len(BYTE *code)
         else if (mod == 2) len += 4;
         else if (mod == 0 && rm == 5) len += 4;
         if (rm == 4) {
-            BYTE sib = code[len];
-            len++;
-            BYTE index = (sib >> 3) & 7;
-            (void)(sib & 7);
-            if (index == 5 && mod == 0) len += 4;
+            BYTE sib = code[len]; len++;
+            if ((sib >> 3) & 7) { } /* index */;
+            if ((sib & 7) == 5 && mod == 0) len += 4;
             if (mod == 1) len++;
             else if (mod == 2) len += 4;
         }
@@ -104,42 +105,30 @@ static int inst_len(BYTE *code)
         BYTE mr = code[o + 1];
         int mod = (mr >> 6) & 3;
         int len = o + 2;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (mod == 1) len++; else if (mod == 2) len += 4;
         return len;
     }
-    if (b == 0x48 || b == 0x8B || b == 0x8D || b == 0x39 || b == 0x3B)
-        return o + 2;
+    if (b == 0x48 || b == 0x8B || b == 0x39 || b == 0x3B) return o + 2;
     if (b == 0xE9) return o + 5;
     if (b == 0xEB) return o + 2;
-    if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90)
-        return o + 1;
+    if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90) return o + 1;
     if (b == 0xF6) {
         BYTE mr = code[o + 1];
         int mod = (mr >> 6) & 3;
         int len = o + 2;
         if ((mr & 0x38) == 0) len++;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (mod == 1) len++; else if (mod == 2) len += 4;
         return len;
     }
     if (b == 0xC7) {
         BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
         int len = o + 6;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (((mr >> 6) & 3) == 1) len++;
+        else if (((mr >> 6) & 3) == 2) len += 4;
         return len;
     }
-    if (b == 0x8A || b == 0x8B) return o + 2;
-    if (b == 0x80 || b == 0x81) {
-        BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int len = (b == 0x80) ? o + 3 : o + 6;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
-        return len;
-    }
+    if (b == 0x80) { BYTE mr = code[o + 1]; return o + 3 + (((mr >> 6) & 3) == 1 ? 1 : ((mr >> 6) & 3) == 2 ? 4 : 0); }
+    if (b == 0x81) { BYTE mr = code[o + 1]; return o + 6 + (((mr >> 6) & 3) == 1 ? 1 : ((mr >> 6) & 3) == 2 ? 4 : 0); }
     return 0;
 }
 #else
@@ -153,8 +142,7 @@ static int inst_len(BYTE *code)
         BYTE mr = code[1];
         int mod = (mr >> 6) & 3;
         int len = 2;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (mod == 1) len++; else if (mod == 2) len += 4;
         if ((mr & 7) == 4 && mod != 3) len++;
         return len;
     }
@@ -162,24 +150,20 @@ static int inst_len(BYTE *code)
         BYTE mr = code[1];
         int mod = (mr >> 6) & 3;
         int len = 3;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (mod == 1) len++; else if (mod == 2) len += 4;
         return len;
     }
     if (b == 0x81 || b == 0xC7) {
         BYTE mr = code[1];
-        int mod = (mr >> 6) & 3;
         int len = 6;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (((mr >> 6) & 3) == 1) len++; else if (((mr >> 6) & 3) == 2) len += 4;
         return len;
     }
     if (b == 0x8D) {
         BYTE mr = code[1];
         int mod = (mr >> 6) & 3;
         int len = 2;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
+        if (mod == 1) len++; else if (mod == 2) len += 4;
         if ((mr & 7) == 4) len++;
         return len;
     }
@@ -194,8 +178,7 @@ static int inst_len(BYTE *code)
             if (mod == 2) return 7;
             return 2;
         }
-        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF)
-            return 3;
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) return 3;
         return 2;
     }
     if ((b & 0xFC) == 0x80) return 3;
@@ -214,15 +197,12 @@ static int socks5_handshake(SOCKET s, const struct sockaddr *target, int namelen
     unsigned char greet[] = {5, 1, 0};
     if (send(s, (const char *)greet, sizeof(greet), 0) != sizeof(greet))
         return -1;
-
     int r = recv(s, (char *)buf, 2, 0);
     if (r != 2 || buf[0] != 5 || buf[1] != 0)
         return -1;
-
     unsigned char req[22];
     int req_len;
     req[0] = 5; req[1] = 1; req[2] = 0;
-
     if (target->sa_family == AF_INET) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)target;
         req[3] = 1;
@@ -235,113 +215,157 @@ static int socks5_handshake(SOCKET s, const struct sockaddr *target, int namelen
         memcpy(req + 4, &in6->sin6_addr, 16);
         memcpy(req + 20, &in6->sin6_port, 2);
         req_len = 22;
-    } else {
-        return -1;
-    }
-
+    } else return -1;
     if (send(s, (const char *)req, req_len, 0) != req_len)
         return -1;
-
     r = recv(s, (char *)buf, sizeof(buf), 0);
     if (r < 10 || buf[0] != 5 || buf[1] != 0)
         return -1;
-
     return 0;
 }
 
-static int resolve_proxy(void)
+static int ensure_proxy_resolved(void)
 {
-    if (g_proxy_resolved) return 0;
+    if (g_proxy_ready) return 0;
     memset(&g_proxy_addr, 0, sizeof(g_proxy_addr));
     g_proxy_addr.sin_family = AF_INET;
     g_proxy_addr.sin_port = htons(g_cfg.port);
-    struct hostent *he = gethostbyname(g_cfg.host);
-    if (!he) return -1;
-    memcpy(&g_proxy_addr.sin_addr, he->h_addr_list[0], he->h_length);
-    g_proxy_resolved = 1;
+    g_proxy_addr.sin_addr.s_addr = inet_addr(g_cfg.host);
+    if (g_proxy_addr.sin_addr.s_addr == INADDR_NONE) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
+        struct hostent *he = gethostbyname(g_cfg.host);
+        if (!he) return -1;
+        memcpy(&g_proxy_addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
+    g_proxy_ready = 1;
     return 0;
 }
 
 static int should_bypass(const struct sockaddr *name)
 {
-    if (name->sa_family == AF_INET || name->sa_family == AF_INET6) {
+    if (name->sa_family == AF_INET) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)name;
-        if (in->sin_addr.s_addr == g_proxy_addr.sin_addr.s_addr &&
-            in->sin_port == g_proxy_addr.sin_port)
-            return 1;
+        return in->sin_addr.s_addr == g_proxy_addr.sin_addr.s_addr &&
+               in->sin_port == g_proxy_addr.sin_port;
     }
     return 0;
 }
 
 static int do_proxy_connect(SOCKET s, const struct sockaddr *name, int namelen)
 {
-    if (resolve_proxy() != 0)
-        return -1;
-
+    if (ensure_proxy_resolved() != 0) return -1;
     if (should_bypass(name))
-        return g_connect.trampoline(s, name, namelen);
-
-    int r = g_connect.trampoline(s, (const struct sockaddr *)&g_proxy_addr, sizeof(g_proxy_addr));
+        return g_orig_connect(s, name, namelen);
+    int r = g_orig_connect(s, (const struct sockaddr *)&g_proxy_addr, sizeof(g_proxy_addr));
     if (r != 0) return r;
-
-    if (socks5_handshake(s, name, namelen) != 0) {
-        closesocket(s);
-        return -1;
-    }
+    if (socks5_handshake(s, name, namelen) != 0) { closesocket(s); return -1; }
     return 0;
 }
 
 static int WINAPI hooked_connect(SOCKET s, const struct sockaddr *name, int namelen)
 {
-    if (!g_connect.trampoline || !g_proxy_resolved)
-        return g_connect.trampoline(s, name, namelen);
+    if (!g_orig_connect) return -1;
     return do_proxy_connect(s, name, namelen);
 }
 
 static int WINAPI hooked_wsaconnect(SOCKET s, const struct sockaddr *name, int namelen,
     LPWSABUF cb, LPWSABUF db, LPQOS sq, LPQOS gq)
 {
-    if (!g_wsaconnect.trampoline || !g_proxy_resolved)
-        return g_wsaconnect.trampoline(s, name, namelen, cb, db, sq, gq);
-
+    if (!g_orig_connect) return -1;
     if (do_proxy_connect(s, name, namelen) != 0)
-        return g_wsaconnect.trampoline(s, name, namelen, cb, db, sq, gq);
-
+        return g_orig_wsaconnect(s, name, namelen, cb, db, sq, gq);
     return 0;
 }
 
-static int prepare_trampoline(void *func, void *hook, BYTE *saved, int *save_size, void **trampoline)
+static void inject_into_process(HANDLE hp)
+{
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_dll, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+
+    size_t sz = (n + 1) * sizeof(wchar_t);
+    void *rem = VirtualAllocEx(hp, NULL, sz, MEM_COMMIT, PAGE_READWRITE);
+    if (!rem) return;
+    WriteProcessMemory(hp, rem, path, sz, NULL);
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC fp = GetProcAddress(k32, "LoadLibraryW");
+    LPTHREAD_START_ROUTINE lib;
+    memcpy(&lib, &fp, sizeof(lib));
+
+    HANDLE rt = CreateRemoteThread(hp, NULL, 0, lib, rem, 0, NULL);
+    if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
+    VirtualFreeEx(hp, rem, 0, MEM_RELEASE);
+}
+
+static BOOL WINAPI hooked_createprocessw(
+    LPCWSTR a, LPWSTR c,
+    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
+    BOOL ih, DWORD f, LPVOID e, LPCWSTR d,
+    LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
+{
+    if (InterlockedExchange(&g_in_create, 1))
+        return g_orig_cpw(a, c, pa, ta, ih, f, e, d, si, pi);
+
+    BOOL susp = (f & CREATE_SUSPENDED) != 0;
+    BOOL r = g_orig_cpw(a, c, pa, ta, ih, f | CREATE_SUSPENDED, e, d, si, pi);
+    if (r) {
+        inject_into_process(pi->hProcess);
+        if (!susp) ResumeThread(pi->hThread);
+    }
+    InterlockedExchange(&g_in_create, 0);
+    return r;
+}
+
+static BOOL WINAPI hooked_createprocessa(
+    LPCSTR a, LPSTR c,
+    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
+    BOOL ih, DWORD f, LPVOID e, LPCSTR d,
+    LPSTARTUPINFOA si, LPPROCESS_INFORMATION pi)
+{
+    if (InterlockedExchange(&g_in_create, 1))
+        return g_orig_cpa(a, c, pa, ta, ih, f, e, d, si, pi);
+
+    BOOL susp = (f & CREATE_SUSPENDED) != 0;
+    BOOL r = g_orig_cpa(a, c, pa, ta, ih, f | CREATE_SUSPENDED, e, d, si, pi);
+    if (r) {
+        inject_into_process(pi->hProcess);
+        if (!susp) ResumeThread(pi->hThread);
+    }
+    InterlockedExchange(&g_in_create, 0);
+    return r;
+}
+
+static int do_trampoline(void *func, void *hook, BYTE *saved, int *sn, void **out)
 {
     int pos = 0;
     while (pos < JMP_SIZE) {
-        int len = inst_len((BYTE *)func + pos);
-        if (len <= 0) break;
-        pos += len;
+        int l = inst_len((BYTE *)func + pos);
+        if (l <= 0) break;
+        pos += l;
     }
     if (pos < JMP_SIZE) pos = JMP_SIZE;
 
-    void *tramp = VirtualAlloc(NULL, pos + JMP_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!tramp) return -1;
+    void *t = VirtualAlloc(NULL, pos + JMP_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!t) return -1;
 
     memcpy(saved, func, pos);
-    memcpy(tramp, func, pos);
-
-    BYTE *tjmp = (BYTE *)tramp + pos;
-    tjmp[0] = 0xE9;
-    *(DWORD *)(tjmp + 1) = (DWORD)((BYTE *)func + pos - ((BYTE *)tjmp + 5));
+    memcpy(t, func, pos);
+    BYTE *tj = (BYTE *)t + pos;
+    tj[0] = 0xE9;
+    *(DWORD *)(tj + 1) = (DWORD)((BYTE *)func + pos - ((BYTE *)tj + 5));
 
     DWORD old;
     VirtualProtect(func, JMP_SIZE, PAGE_EXECUTE_READWRITE, &old);
-
-    BYTE *tgt = (BYTE *)func;
-    tgt[0] = 0xE9;
-    *(DWORD *)(tgt + 1) = (DWORD)((BYTE *)hook - (tgt + 5));
-
+    BYTE *tg = (BYTE *)func;
+    tg[0] = 0xE9;
+    *(DWORD *)(tg + 1) = (DWORD)((BYTE *)hook - (tg + 5));
     VirtualProtect(func, JMP_SIZE, old, &old);
     FlushInstructionCache(GetCurrentProcess(), func, JMP_SIZE);
 
-    *save_size = pos;
-    *trampoline = tramp;
+    *sn = pos;
+    *out = t;
     return 0;
 }
 
@@ -353,30 +377,32 @@ static void install_hooks(void)
         if (!mod) return;
     }
 
-    void *addr = GetProcAddress(mod, "connect");
+    void *addr;
+    addr = GetProcAddress(mod, "connect");
     if (addr) {
-        g_connect.target = addr;
-        prepare_trampoline(addr, hooked_connect,
-            g_connect.saved, &g_connect.save_size,
-            (void **)&g_connect.trampoline);
+        g_target_connect = addr;
+        do_trampoline(addr, hooked_connect, g_saved_conn, &g_saved_conn_n, (void **)&g_orig_connect);
     }
-
     addr = GetProcAddress(mod, "WSAConnect");
     if (addr) {
-        g_wsaconnect.target = addr;
-        prepare_trampoline(addr, hooked_wsaconnect,
-            g_wsaconnect.saved, &g_wsaconnect.save_size,
-            (void **)&g_wsaconnect.trampoline);
+        g_target_wsaconnect = addr;
+        do_trampoline(addr, hooked_wsaconnect, g_saved_wsa, &g_saved_wsa_n, (void **)&g_orig_wsaconnect);
     }
 
-    if (g_connect.trampoline)
-        resolve_proxy();
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    addr = GetProcAddress(k32, "CreateProcessW");
+    if (addr)
+        do_trampoline(addr, hooked_createprocessw, g_saved_cpw, &g_saved_cpw_n, (void **)&g_orig_cpw);
+    addr = GetProcAddress(k32, "CreateProcessA");
+    if (addr)
+        do_trampoline(addr, hooked_createprocessa, g_saved_cpa, &g_saved_cpa_n, (void **)&g_orig_cpa);
 }
 
 BOOL WINAPI DllMain(HINSTANCE dll, DWORD reason, LPVOID res)
 {
     (void)res;
     if (reason == DLL_PROCESS_ATTACH) {
+        g_dll = dll;
         DisableThreadLibraryCalls(dll);
         char buf[512];
         DWORD len = GetEnvironmentVariableA(ENV_VAR, buf, sizeof(buf));
