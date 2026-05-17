@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [x64, x86]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64
+
+      - name: Build ${{ matrix.arch }}
+        run: make ${{ matrix.arch }}
+
+      - name: Package ${{ matrix.arch }}
+        run: |
+          cd build_${{ matrix.arch }}
+          zip -j ../proxy_wrapper_${{ matrix.arch }}.zip proxy_wrapper.exe socks_hook.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy_wrapper_${{ matrix.arch }}
+          path: build_${{ matrix.arch }}/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            proxy_wrapper_x64.zip
+            proxy_wrapper_x86.zip
+          generate_release_notes: true
