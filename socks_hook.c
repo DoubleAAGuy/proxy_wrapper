@@ -38,12 +38,36 @@ static BYTE g_saved_cpa[16];  static int g_saved_cpa_n;
 static void *g_target_connect;
 static void *g_target_wsaconnect;
 
+// Returns total bytes consumed by ModRM [+SIB] [displacement] starting at code[off].
+// Does NOT count the immediate.
+static int modrm_off(BYTE *code, int off)
+{
+    BYTE mr = code[off];
+    int mod = (mr >> 6) & 3;
+    int rm = mr & 7;
+    int total = 1;
+    if (rm == 4 && mod != 3) {
+        total++;
+        BYTE sib = code[off + 1];
+        int base = sib & 7;
+        if (mod == 0 && base == 5) total += 4;
+        else if (mod == 1) total++;
+        else if (mod == 2) total += 4;
+    } else {
+        if (mod == 0 && rm == 5) total += 4;
+        else if (mod == 1) total++;
+        else if (mod == 2) total += 4;
+    }
+    return total;
+}
+
 #ifdef _WIN64
 static int inst_len(BYTE *code)
 {
     int o = 0;
-    if (code[o] >= 0x40 && code[o] <= 0x4F) o++;
+    while (code[o] >= 0x40 && code[o] <= 0x4F) o++;
     BYTE b = code[o];
+
     if (b == 0x0F) {
         BYTE op2 = code[o + 1];
         if (op2 == 0x84 || op2 == 0x85 || op2 == 0x86 || op2 == 0x87 ||
@@ -57,78 +81,51 @@ static int inst_len(BYTE *code)
             if (mod == 2) return o + 7;
             return o + 2;
         }
-        if (op2 == 0xB6 || op2 == 0xB7) return o + 3;
-        if (op2 == 0xAF) return o + 3;
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF)
+            return o + 2 + modrm_off(code, o + 2);
+        if ((op2 & 0xF0) == 0x40)  /* CMOVcc */
+            return o + 2 + modrm_off(code, o + 2);
+        if (op2 == 0xAF) /* IMUL */
+            return o + 2 + modrm_off(code, o + 2);
         return 0;
     }
-    if (b == 0x83) {
+
+    /* MOV r/m,r | MOV r,r/m | MOVZX | LEA | CMP | TEST | XOR | ADD/OR/ADC/SBB/AND/SUB/XOR r/m,reg */
+    if (b == 0x88 || b == 0x89 || b == 0x8A || b == 0x8B || b == 0x8D ||
+        b == 0x38 || b == 0x39 || b == 0x3A || b == 0x3B ||
+        b == 0x85 || b == 0x84 || b == 0x86 || b == 0x87 ||
+        b == 0x33 || b == 0x01 || b == 0x02 || b == 0x03 ||
+        b == 0x08 || b == 0x09 || b == 0x0A || b == 0x0B ||
+        b == 0x11 || b == 0x12 || b == 0x13 ||
+        b == 0x19 || b == 0x1A || b == 0x1B ||
+        b == 0x21 || b == 0x22 || b == 0x23 ||
+        b == 0x29 || b == 0x2A || b == 0x2B ||
+        b == 0x31 || b == 0x32)
+        return o + 1 + modrm_off(code, o + 1);
+
+    /* Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm8/imm32 */
+    if (b == 0x80) return o + 1 + modrm_off(code, o + 1) + 1;  /* imm8 */
+    if (b == 0x81) return o + 1 + modrm_off(code, o + 1) + 4;  /* imm32 */
+    if (b == 0x83) return o + 1 + modrm_off(code, o + 1) + 1;  /* imm8 */
+
+    /* MOV r/m, imm32 */
+    if (b == 0xC7) return o + 1 + modrm_off(code, o + 1) + 4;
+
+    /* Group 3 */
+    if (b == 0xF6 || b == 0xF7) {
         BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int len = o + 3;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
-        else if (mod == 0 && (mr & 7) == 4) len++;
-        else if (mod == 0 && (mr & 7) == 5) len += 4;
-        if ((mr & 7) == 4) {
-            BYTE sib = code[len - 1];
-            if ((sib & 7) == 5 && mod == 0) len += 4;
-        }
-        return len;
+        int reg = (mr >> 3) & 7;
+        if (reg == 0) /* TEST */
+            return o + 1 + modrm_off(code, o + 1) + ((b == 0xF6) ? 1 : 4);
+        return o + 1 + modrm_off(code, o + 1);
     }
-    if (b == 0x89 || b == 0x8B || b == 0x8D) {
-        BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int rm = mr & 7;
-        int len = o + 2;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
-        else if (mod == 0 && rm == 5) len += 4;
-        if (rm == 4) {
-            BYTE sib = code[len]; len++;
-            if ((sib >> 3) & 7) { } /* index */;
-            if ((sib & 7) == 5 && mod == 0) len += 4;
-            if (mod == 1) len++;
-            else if (mod == 2) len += 4;
-        }
-        return len;
-    }
-    if ((b >= 0x50 && b <= 0x57) || b == 0x55) return o + 1;
-    if (b == 0x85 || b == 0x8A) {
-        BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int len = o + 2;
-        if (mod == 1) len++;
-        else if (mod == 2) len += 4;
-        return len;
-    }
-    if (b == 0x33) {
-        BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int len = o + 2;
-        if (mod == 1) len++; else if (mod == 2) len += 4;
-        return len;
-    }
-    if (b == 0x48 || b == 0x8B || b == 0x39 || b == 0x3B) return o + 2;
-    if (b == 0xE9) return o + 5;
-    if (b == 0xEB) return o + 2;
-    if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90) return o + 1;
-    if (b == 0xF6) {
-        BYTE mr = code[o + 1];
-        int mod = (mr >> 6) & 3;
-        int len = o + 2;
-        if ((mr & 0x38) == 0) len++;
-        if (mod == 1) len++; else if (mod == 2) len += 4;
-        return len;
-    }
-    if (b == 0xC7) {
-        BYTE mr = code[o + 1];
-        int len = o + 6;
-        if (((mr >> 6) & 3) == 1) len++;
-        else if (((mr >> 6) & 3) == 2) len += 4;
-        return len;
-    }
-    if (b == 0x80) { BYTE mr = code[o + 1]; return o + 3 + (((mr >> 6) & 3) == 1 ? 1 : ((mr >> 6) & 3) == 2 ? 4 : 0); }
-    if (b == 0x81) { BYTE mr = code[o + 1]; return o + 6 + (((mr >> 6) & 3) == 1 ? 1 : ((mr >> 6) & 3) == 2 ? 4 : 0); }
+
+    if (b == 0xE9 || b == 0xE8) return o + 5;   /* JMP/CALL rel32 */
+    if (b == 0xEB)              return o + 2;   /* JMP rel8 */
+    if (b >= 0x70 && b <= 0x7F) return o + 2;   /* Jcc rel8 */
+    if (b >= 0x50 && b <= 0x5F) return o + 1;   /* PUSH/POP */
+    if (b == 0xC3 || b == 0xCB || b == 0xC9 || b == 0xCC || b == 0x90)
+        return o + 1;
     return 0;
 }
 #else
@@ -136,37 +133,36 @@ static int inst_len(BYTE *code)
 {
     BYTE b = code[0];
     if (b == 0x55 || b == 0x53 || b == 0x56 || b == 0x57) return 1;
+    if (b >= 0x50 && b <= 0x5F) return 1;
     if (b == 0x6A) return 2;
     if (b == 0x68) return 5;
-    if (b == 0x8B) {
+
+    if (b == 0x88 || b == 0x89 || b == 0x8A || b == 0x8B || b == 0x8D ||
+        b == 0x38 || b == 0x39 || b == 0x3A || b == 0x3B ||
+        b == 0x85 || b == 0x84 || b == 0x86 || b == 0x87 ||
+        b == 0x33 || b == 0x01 || b == 0x02 || b == 0x03 ||
+        b == 0x08 || b == 0x09 || b == 0x0A || b == 0x0B ||
+        b == 0x11 || b == 0x12 || b == 0x13 ||
+        b == 0x19 || b == 0x1A || b == 0x1B ||
+        b == 0x21 || b == 0x22 || b == 0x23 ||
+        b == 0x29 || b == 0x2A || b == 0x2B ||
+        b == 0x31 || b == 0x32)
+        return 1 + modrm_off(code, 1);
+
+    if (b == 0x80 || b == 0x82) return 1 + modrm_off(code, 1) + 1;
+    if (b == 0x81) return 1 + modrm_off(code, 1) + 4;
+    if (b == 0x83) return 1 + modrm_off(code, 1) + 1;
+
+    if (b == 0xC7) return 1 + modrm_off(code, 1) + 4;
+
+    if (b == 0xF6 || b == 0xF7) {
         BYTE mr = code[1];
-        int mod = (mr >> 6) & 3;
-        int len = 2;
-        if (mod == 1) len++; else if (mod == 2) len += 4;
-        if ((mr & 7) == 4 && mod != 3) len++;
-        return len;
+        int reg = (mr >> 3) & 7;
+        if (reg == 0)
+            return 1 + modrm_off(code, 1) + ((b == 0xF6) ? 1 : 4);
+        return 1 + modrm_off(code, 1);
     }
-    if (b == 0x83) {
-        BYTE mr = code[1];
-        int mod = (mr >> 6) & 3;
-        int len = 3;
-        if (mod == 1) len++; else if (mod == 2) len += 4;
-        return len;
-    }
-    if (b == 0x81 || b == 0xC7) {
-        BYTE mr = code[1];
-        int len = 6;
-        if (((mr >> 6) & 3) == 1) len++; else if (((mr >> 6) & 3) == 2) len += 4;
-        return len;
-    }
-    if (b == 0x8D) {
-        BYTE mr = code[1];
-        int mod = (mr >> 6) & 3;
-        int len = 2;
-        if (mod == 1) len++; else if (mod == 2) len += 4;
-        if ((mr & 7) == 4) len++;
-        return len;
-    }
+
     if (b == 0x0F) {
         BYTE op2 = code[1];
         if ((op2 & 0xF0) == 0x80) return 6;
@@ -178,14 +174,22 @@ static int inst_len(BYTE *code)
             if (mod == 2) return 7;
             return 2;
         }
-        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) return 3;
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF)
+            return 2 + modrm_off(code, 2);
+        if ((op2 & 0xF0) == 0x40)
+            return 2 + modrm_off(code, 2);
+        if (op2 == 0xAF)
+            return 2 + modrm_off(code, 2);
         return 2;
     }
-    if ((b & 0xFC) == 0x80) return 3;
-    if (b == 0xE9) return 5;
-    if (b == 0xEB) return 2;
+
+    if (b == 0xE9 || b == 0xE8) return 5;
+    if (b == 0xEB)              return 2;
+    if (b >= 0x70 && b <= 0x7F) return 2;
     if (b == 0xC3 || b == 0xC9 || b == 0x90 || b == 0xCC) return 1;
-    if (b == 0xA1) return 5;
+    if (b == 0xA1 || b == 0xA2 || b == 0xA3) return 5;
+    if (b >= 0xB0 && b <= 0xB7) return 2;
+    if (b >= 0xB8 && b <= 0xBF) return 5;
     return 1;
 }
 #endif
@@ -295,7 +299,7 @@ static void inject_into_process(HANDLE hp)
     memcpy(&lib, &fp, sizeof(lib));
 
     HANDLE rt = CreateRemoteThread(hp, NULL, 0, lib, rem, 0, NULL);
-    if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
+    if (rt) { WaitForSingleObject(rt, 2000); CloseHandle(rt); }
     VirtualFreeEx(hp, rem, 0, MEM_RELEASE);
 }
 
@@ -307,6 +311,11 @@ static BOOL WINAPI hooked_createprocessw(
 {
     if (InterlockedExchange(&g_in_create, 1))
         return g_orig_cpw(a, c, pa, ta, ih, f, e, d, si, pi);
+
+    if (f & (DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS)) {
+        InterlockedExchange(&g_in_create, 0);
+        return g_orig_cpw(a, c, pa, ta, ih, f, e, d, si, pi);
+    }
 
     BOOL susp = (f & CREATE_SUSPENDED) != 0;
     BOOL r = g_orig_cpw(a, c, pa, ta, ih, f | CREATE_SUSPENDED, e, d, si, pi);
@@ -326,6 +335,11 @@ static BOOL WINAPI hooked_createprocessa(
 {
     if (InterlockedExchange(&g_in_create, 1))
         return g_orig_cpa(a, c, pa, ta, ih, f, e, d, si, pi);
+
+    if (f & (DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS)) {
+        InterlockedExchange(&g_in_create, 0);
+        return g_orig_cpa(a, c, pa, ta, ih, f, e, d, si, pi);
+    }
 
     BOOL susp = (f & CREATE_SUSPENDED) != 0;
     BOOL r = g_orig_cpa(a, c, pa, ta, ih, f | CREATE_SUSPENDED, e, d, si, pi);
