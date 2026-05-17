@@ -8,12 +8,13 @@ static void usage(void)
     fprintf(stderr,
         "Usage: proxy_wrapper.exe -proxy=IP:PORT -target=PATH [target args...]\n"
         "\n"
-        "Wraps an executable in a SOCKS5 proxy by hooking its Winsock connect() calls\n"
-        "via DLL injection.\n"
+        "Forces the target executable to route all TCP connections through a\n"
+        "SOCKS5 proxy by hooking Winsock connect()/WSAConnect() via DLL injection.\n"
         "\n"
         "Examples:\n"
         "  proxy_wrapper.exe -proxy=127.0.0.1:1080 -target=chrome.exe\n"
-        "  proxy_wrapper.exe -proxy=192.168.1.50:9050 -target=\"C:\\Program Files\\Firefox\\firefox.exe\"\n"
+        "  proxy_wrapper.exe -proxy=192.168.1.50:9050 -target=powershell.exe -Command \"curl.exe ifconfig.me\"\n"
+        "  proxy_wrapper.exe -proxy=10.0.0.1:1080 -target=\"C:\\Program Files\\Firefox\\firefox.exe\"\n"
     );
 }
 
@@ -40,17 +41,29 @@ int main(int argc, char *argv[])
     SetEnvironmentVariableA("PROXY_WRAPPER_PROXY", proxy);
 
     char cmdline[32768];
-    cmdline[0] = 0;
-    if (strchr(target, ' ')) {
-        cmdline[0] = '"';
-        strcpy(cmdline + 1, target);
-        strcat(cmdline, "\"");
-    } else {
-        strcpy(cmdline, target);
-    }
-    for (int i = target_idx + 1; i < argc; i++) {
-        strcat(cmdline, " ");
-        strcat(cmdline, argv[i]);
+    {
+        int pos = 0;
+        if (strchr(target, ' ')) {
+            cmdline[pos++] = '"';
+            int len = (int)strlen(target);
+            memcpy(cmdline + pos, target, len);
+            pos += len;
+            cmdline[pos++] = '"';
+        } else {
+            int len = (int)strlen(target);
+            memcpy(cmdline + pos, target, len);
+            pos += len;
+        }
+        for (int i = target_idx + 1; i < argc; i++) {
+            cmdline[pos++] = ' ';
+            int has_space = (strchr(argv[i], ' ') != NULL);
+            if (has_space) cmdline[pos++] = '"';
+            int len = (int)strlen(argv[i]);
+            memcpy(cmdline + pos, argv[i], len);
+            pos += len;
+            if (has_space) cmdline[pos++] = '"';
+        }
+        cmdline[pos] = 0;
     }
 
     char dll_path[MAX_PATH];
@@ -75,8 +88,7 @@ int main(int argc, char *argv[])
     void *remote = VirtualAllocEx(pi.hProcess, NULL, dll_len, MEM_COMMIT, PAGE_READWRITE);
     if (!remote) {
         fprintf(stderr, "Error: VirtualAllocEx failed (code %lu)\n", GetLastError());
-        TerminateProcess(pi.hProcess, 1);
-        return 1;
+        TerminateProcess(pi.hProcess, 1); return 1;
     }
     WriteProcessMemory(pi.hProcess, remote, dll_path, dll_len, NULL);
 
@@ -88,12 +100,13 @@ int main(int argc, char *argv[])
     HANDLE rt = CreateRemoteThread(pi.hProcess, NULL, 0, loadlib, remote, 0, NULL);
     if (!rt) {
         fprintf(stderr, "Error: CreateRemoteThread failed (code %lu)\n", GetLastError());
-        TerminateProcess(pi.hProcess, 1);
-        return 1;
+        TerminateProcess(pi.hProcess, 1); return 1;
     }
     WaitForSingleObject(rt, INFINITE);
     CloseHandle(rt);
     VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+
+    SetEnvironmentVariableA("PROXY_WRAPPER_PROXY", NULL);
 
     ResumeThread(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
